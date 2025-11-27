@@ -7,6 +7,11 @@ const auth_url = 'https://auth.docker.io';
 
 let 屏蔽爬虫UA = ['netcraft'];
 
+// 请求计数器（简单的内存计数器，实际使用中可能需要更复杂的解决方案）
+let requestCount = 0;
+const MAX_REQUESTS_PER_MINUTE = 50;
+let lastResetTime = Date.now();
+
 // 根据主机名选择对应的上游地址
 function routeByHosts(host) {
 	// 定义路由表
@@ -62,6 +67,41 @@ function newUrl(urlStr, base) {
 		console.error(err);
 		return null // 构造失败返回null
 	}
+}
+
+/**
+ * 速率限制检查
+ */
+async function checkRateLimit() {
+	const now = Date.now();
+	// 每分钟重置计数器
+	if (now - lastResetTime > 60000) {
+		requestCount = 0;
+		lastResetTime = now;
+	}
+	
+	requestCount++;
+	if (requestCount > MAX_REQUESTS_PER_MINUTE) {
+		// 添加延迟以避免速率限制
+		await new Promise(resolve => setTimeout(resolve, 1000));
+	}
+}
+
+/**
+ * 带认证和缓存的 fetch 请求
+ */
+async function authFetch(url, options, env) {
+	await checkRateLimit();
+	
+	// 如果有 Docker Hub 认证信息，添加到请求头
+	if (env.DOCKERHUB_USERNAME && env.DOCKERHUB_PASSWORD && 
+		(url.includes('auth.docker.io') || url.includes('index.docker.io'))) {
+		const credentials = btoa(`${env.DOCKERHUB_USERNAME}:${env.DOCKERHUB_PASSWORD}`);
+		if (!options.headers) options.headers = {};
+		options.headers['Authorization'] = `Basic ${credentials}`;
+	}
+	
+	return fetch(url, options);
 }
 
 async function nginx() {
@@ -483,7 +523,7 @@ export default {
 					url.searchParams.set('q', search.replace('library/', ''));
 				}
 				const newRequest = new Request(url, request);
-				return fetch(newRequest);
+				return authFetch(newRequest.url, newRequest, env);
 			}
 		}
 
@@ -507,8 +547,17 @@ export default {
 					'Cache-Control': 'max-age=0'
 				}
 			};
+			
+			// 添加 Docker Hub 认证以避免速率限制
+			if (env.DOCKERHUB_USERNAME && env.DOCKERHUB_PASSWORD) {
+				const credentials = btoa(`${env.DOCKERHUB_USERNAME}:${env.DOCKERHUB_PASSWORD}`);
+				token_parameter.headers['Authorization'] = `Basic ${credentials}`;
+			}
+			
 			let token_url = auth_url + url.pathname + url.search;
-			return fetch(new Request(token_url, request), token_parameter);
+			
+			// 使用带认证的 fetch
+			return authFetch(token_url, new Request(token_url, request), env);
 		}
 
 		// 修改 /v2/ 请求路径
@@ -536,7 +585,9 @@ export default {
 			}
 			if (repo) {
 				const tokenUrl = `${auth_url}/token?service=registry.docker.io&scope=repository:${repo}:pull`;
-				const tokenRes = await fetch(tokenUrl, {
+				
+				// 使用带认证的 token 请求
+				const tokenRes = await authFetch(tokenUrl, {
 					headers: {
 						'User-Agent': getReqHeader("User-Agent"),
 						'Accept': getReqHeader("Accept"),
@@ -545,7 +596,22 @@ export default {
 						'Connection': 'keep-alive',
 						'Cache-Control': 'max-age=0'
 					}
-				});
+				}, env);
+				
+				if (tokenRes.status === 429) {
+					// 如果遇到速率限制，返回友好错误
+					return new Response(JSON.stringify({
+						"detail": "Rate limit exceeded, please try again later or add Docker Hub credentials",
+						"error": true
+					}), {
+						status: 429,
+						headers: {
+							'Content-Type': 'application/json',
+							'Retry-After': '60'
+						}
+					});
+				}
+				
 				const tokenData = await tokenRes.json();
 				const token = tokenData.token;
 				let parameter = {
@@ -556,15 +622,19 @@ export default {
 						'Accept-Language': getReqHeader("Accept-Language"),
 						'Accept-Encoding': getReqHeader("Accept-Encoding"),
 						'Connection': 'keep-alive',
-						'Cache-Control': 'max-age=0',
+						'Cache-Control': 'max-age=3600', // 增加缓存时间
 						'Authorization': `Bearer ${token}`
 					},
-					cacheTtl: 3600
+					cf: {
+						// 使用 Cloudflare 缓存
+						cacheEverything: true,
+						cacheTtl: 3600
+					}
 				};
 				if (request.headers.has("X-Amz-Content-Sha256")) {
 					parameter.headers['X-Amz-Content-Sha256'] = getReqHeader("X-Amz-Content-Sha256");
 				}
-				let original_response = await fetch(new Request(url, request), parameter);
+				let original_response = await authFetch(url.toString(), new Request(url, request), env);
 				let original_response_clone = original_response.clone();
 				let original_text = original_response_clone.body;
 				let response_headers = original_response.headers;
@@ -597,9 +667,13 @@ export default {
 				'Accept-Language': getReqHeader("Accept-Language"),
 				'Accept-Encoding': getReqHeader("Accept-Encoding"),
 				'Connection': 'keep-alive',
-				'Cache-Control': 'max-age=0'
+				'Cache-Control': 'max-age=3600' // 增加缓存时间
 			},
-			cacheTtl: 3600 // 缓存时间
+			cf: {
+				// 使用 Cloudflare 缓存
+				cacheEverything: true,
+				cacheTtl: 3600
+			}
 		};
 
 		// 添加Authorization头
@@ -613,7 +687,7 @@ export default {
 		}
 
 		// 发起请求并处理响应
-		let original_response = await fetch(new Request(url, request), parameter);
+		let original_response = await authFetch(url.toString(), new Request(url, request), env);
 		let original_response_clone = original_response.clone();
 		let original_text = original_response_clone.body;
 		let response_headers = original_response.headers;
